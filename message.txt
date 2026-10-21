@@ -12,11 +12,602 @@ local function getService(name)
     if not service then
         service = game:GetService(name)
         if type(cloneref) == "function" then
-            service = cloneref(service)
+            local ok, cloned = pcall(cloneref, service)
+            if ok and cloned then service = cloned end
         end
         serviceCache[name] = service
     end
     return service
+end
+local SanXCompat = (function()
+local Compat = {}
+local lastNative
+local defaults = {
+    keypress = keypress,
+    keyrelease = keyrelease,
+    mouse1press = mouse1press,
+    mouse1release = mouse1release,
+    mouse1click = mouse1click,
+    mousemoveabs = mousemoveabs,
+    getconnections = getconnections,
+    firesignal = firesignal,
+    readfile = readfile,
+    writefile = writefile,
+    listfiles = listfiles,
+    appendfile = appendfile,
+    delfile = delfile,
+    request = request,
+    http_request = http_request,
+    queue_on_teleport = queue_on_teleport,
+    queueonteleport = queueonteleport,
+    getcustomasset = getcustomasset,
+    getgc = getgc,
+    cloneref = cloneref,
+    warn = warn,
+    syn = syn,
+    http = http,
+}
+
+local function get(owner, key)
+    if owner == nil then
+        return nil
+    end
+    local ok, value = pcall(function()
+        return owner[key]
+    end)
+    if ok then
+        return value
+    end
+    return nil
+end
+
+local function fn(owner, key)
+    local value = get(owner, key)
+    return if type(value) == "function" then value else nil
+end
+
+local function environment(env)
+    return if type(env) == "table" then env else defaults
+end
+
+local function invoke(method, ...)
+    local values = table.pack(pcall(method, ...))
+    if values[1] and values[2] == false then
+        values[1], values[2], values.n = false, "input backend rejected event", 2
+    end
+    return values
+end
+
+local function nativeCall(native, name, ...)
+    local method = fn(native, name)
+    if not method then
+        return table.pack(false, name .. " unavailable")
+    end
+    return invoke(method, native, ...)
+end
+
+local function result(values)
+    return table.unpack(values, 2, values.n)
+end
+
+local function failure(name, nativeError, fallbackError)
+    error("SanX input " .. name .. " failed: " .. tostring(fallbackError or nativeError), 3)
+end
+
+function Compat.createVirtualInput(native, env)
+    env = environment(env)
+    lastNative = native
+    local proxy = {}
+    local clickSucceeded = false
+    local warned = {}
+    local function unavailable(name, nativeError, message)
+        if not warned[message] then
+            warned[message] = true
+            local report = fn(env, "warn") or fn(defaults, "warn")
+            if report then
+                pcall(report, "SanX input: " .. message)
+            end
+        end
+        failure(name, nativeError, message)
+    end
+
+    function proxy:SendKeyEvent(isDown, keyCode, ...)
+        local values = nativeCall(native, "SendKeyEvent", isDown, keyCode, ...)
+        if values[1] then
+            return result(values)
+        end
+        local keyValue = keyCode
+        if type(keyValue) ~= "number" then
+            keyValue = get(keyCode, "Value")
+        end
+        if type(isDown) ~= "boolean" or type(keyValue) ~= "number" then
+            failure("SendKeyEvent", values[2], "invalid key event")
+        end
+        local method = fn(env, if isDown then "keypress" else "keyrelease")
+        if not method then
+            unavailable("SendKeyEvent", values[2], if isDown then "keypress unavailable" else "keyrelease unavailable")
+        end
+        if isDown and not fn(env, "keyrelease") then
+            unavailable("SendKeyEvent", values[2], "paired keyrelease unavailable")
+        end
+        local fallback = invoke(method, keyValue)
+        if not fallback[1] then
+            failure("SendKeyEvent", values[2], fallback[2])
+        end
+        return result(fallback)
+    end
+
+    function proxy:SendMouseButtonEvent(x, y, button, isDown, ...)
+        local values = nativeCall(native, "SendMouseButtonEvent", x, y, button, isDown, ...)
+        if values[1] then
+            clickSucceeded = false
+            return result(values)
+        end
+        if button ~= 0 or type(isDown) ~= "boolean" then
+            failure("SendMouseButtonEvent", values[2], "no fallback for this mouse event")
+        end
+        if not isDown and clickSucceeded then
+            clickSucceeded = false
+            return
+        end
+        local press, release = fn(env, "mouse1press"), fn(env, "mouse1release")
+        if isDown then
+            clickSucceeded = false
+            local click = fn(env, "mouse1click")
+            if not (press and release) and not click then
+                unavailable("SendMouseButtonEvent", values[2], "mouse press/release pair and mouse1click unavailable")
+            end
+            local move = fn(env, "mousemoveabs")
+            if not move then
+                unavailable("SendMouseButtonEvent", values[2], "positioned mouse fallback unavailable: mousemoveabs missing")
+            end
+            if type(x) ~= "number" or type(y) ~= "number" or x ~= x or y ~= y
+                or math.abs(x) == math.huge or math.abs(y) == math.huge then
+                failure("SendMouseButtonEvent", values[2], "invalid pointer coordinates")
+            end
+            local moved = invoke(move, x, y)
+            if not moved[1] then
+                failure("SendMouseButtonEvent", values[2], moved[2])
+            end
+            if press and release then
+                local fallback = invoke(press)
+                if fallback[1] then
+                    return result(fallback)
+                end
+                values = fallback
+            end
+            if click then
+                local fallback = invoke(click)
+                if fallback[1] then
+                    clickSucceeded = true
+                    return result(fallback)
+                end
+                failure("SendMouseButtonEvent", values[2], fallback[2])
+            end
+            failure("SendMouseButtonEvent", values[2], "mouse press fallback failed")
+        end
+        if not release then
+            unavailable("SendMouseButtonEvent", values[2], "mouse1release unavailable")
+        end
+        local fallback = invoke(release)
+        if not fallback[1] then
+            failure("SendMouseButtonEvent", values[2], fallback[2])
+        end
+        return result(fallback)
+    end
+
+    return setmetatable(proxy, {
+        __index = function(_, key)
+            local value = get(native, key)
+            if type(value) == "function" then
+                return function(_, ...)
+                    return value(native, ...)
+                end
+            end
+            return value
+        end,
+    })
+end
+
+function Compat.capabilities(env, native)
+    env = environment(env)
+    if native == nil then
+        native = lastNative
+    end
+    return {
+        nativePresent = native ~= nil,
+        nativeKeyEvent = fn(native, "SendKeyEvent") ~= nil,
+        nativeMouseButtonEvent = fn(native, "SendMouseButtonEvent") ~= nil,
+        keypress = fn(env, "keypress") ~= nil,
+        keyrelease = fn(env, "keyrelease") ~= nil,
+        mouse1press = fn(env, "mouse1press") ~= nil,
+        mouse1release = fn(env, "mouse1release") ~= nil,
+        mouse1click = fn(env, "mouse1click") ~= nil,
+        mousemoveabs = fn(env, "mousemoveabs") ~= nil,
+        positionedMouseFallback = fn(env, "mousemoveabs") ~= nil and
+            ((fn(env, "mouse1press") ~= nil and fn(env, "mouse1release") ~= nil) or fn(env, "mouse1click") ~= nil),
+        getconnections = fn(env, "getconnections") ~= nil,
+        firesignal = fn(env, "firesignal") ~= nil,
+        filesRead = fn(env, "readfile") ~= nil,
+        filesWrite = fn(env, "writefile") ~= nil,
+        filesList = fn(env, "listfiles") ~= nil,
+        filesAppend = fn(env, "appendfile") ~= nil,
+        filesDelete = fn(env, "delfile") ~= nil,
+        request = fn(env, "request") ~= nil or fn(env, "http_request") ~= nil
+            or fn(get(env, "syn"), "request") ~= nil or fn(get(env, "http"), "request") ~= nil,
+        queueOnTeleport = fn(env, "queue_on_teleport") ~= nil or fn(env, "queueonteleport") ~= nil,
+        getcustomasset = fn(env, "getcustomasset") ~= nil,
+        getgc = fn(env, "getgc") ~= nil,
+        cloneref = fn(env, "cloneref") ~= nil,
+    }
+end
+
+return Compat
+end)()
+local SanXDeltaControls = (function()
+local Gate = {}
+Gate.__index = Gate
+
+local function field(owner, key)
+    local ok, value = pcall(function()
+        return owner[key]
+    end)
+    return if ok then value else nil
+end
+
+local function callable(owner, key)
+    local value = field(owner, key)
+    return if type(value) == "function" then value else nil
+end
+
+local function alive(humanoid)
+    local health = humanoid and field(humanoid, "Health")
+    return type(health) == "number" and health > 0
+end
+
+local function disabled(controls)
+    return field(controls, "disabled") == true or field(controls, "controlsEnabled") == false
+end
+
+local function selectTouchValues(selectTouch, controls)
+    local selected = table.pack(pcall(selectTouch, controls))
+    local accepted = selected[1] and ((selected[2] ~= nil and selected[3] ~= false) or (selected[2] == nil and selected[3] == true))
+    return accepted, selected
+end
+
+function Gate.new(options)
+    return setmetatable({ options = options or {}, active = false, movementOwned = false, destroyed = false, warned = {}, lastGateJumpPulse = false, initialChecked = false, recoveryUsed = false }, Gate)
+end
+
+function Gate:_warn(key, message)
+    if self.warned[key] then
+        return
+    end
+    self.warned[key] = true
+    if type(self.options.warn) == "function" then
+        pcall(self.options.warn, "SanX Delta controls: " .. message)
+    end
+end
+
+function Gate:_resync(controls)
+    local resync = self.resync
+    if resync and type(self.options.getLastInputType) == "function" then
+        local gotInput, input = pcall(self.options.getLastInputType)
+        if gotInput then
+            local synced, accepted = pcall(resync, controls, input)
+            if not synced or accepted == false then
+                self:_warn("resync", "native input resync was unavailable")
+            end
+        else
+            self:_warn("inputType", "current input type was unavailable")
+        end
+    else
+        self:_warn("resyncMissing", "native input resync was unavailable")
+    end
+end
+
+function Gate:_restoreCallbacks(movementOnly)
+    local success, selectorRestored = true, false
+    local retained = {}
+    for _, entry in ipairs(self.callbacks or {}) do
+        if movementOnly and entry.kind ~= "movement" then
+            table.insert(retained, entry)
+        elseif field(self.controls, entry.key) == entry.wrapper then
+            local restored = pcall(function()
+                self.controls[entry.key] = entry.original
+            end)
+            restored = restored and field(self.controls, entry.key) == entry.original
+            if not restored then
+                success = false
+                table.insert(retained, entry)
+            elseif entry.kind == "selector" then
+                selectorRestored = true
+            end
+        end
+    end
+    self.callbacks = retained
+    return success, selectorRestored
+end
+
+function Gate:release()
+    self.active, self.movementOwned = false, false
+    self.selectorToken, self.movementToken = nil, nil
+    self.lastGateJumpPulse, self.jumpHumanoid = false, nil
+    local controls = self.controls
+    if not controls then
+        return true
+    end
+    local success, selectorRestored = self:_restoreCallbacks(false)
+    if selectorRestored then
+        self:_resync(controls)
+    end
+    if #self.callbacks == 0 then
+        self.controls, self.callbacks, self.resync = nil, nil, nil
+    end
+    if not success then
+        self:_warn("restore", "a controls callback could not be restored")
+    end
+    return success
+end
+
+function Gate:_ownsCallbacks()
+    for _, entry in ipairs(self.callbacks or {}) do
+        if field(self.controls, entry.key) ~= entry.wrapper then
+            return false
+        end
+    end
+    return true
+end
+
+function Gate:pauseMovement()
+    if not self.active then
+        return self:release()
+    end
+    if not self:_ownsCallbacks() then
+        self:release()
+        self:_warn("ownership", "another owner changed a controls callback")
+        return false
+    end
+    self.movementOwned, self.movementToken = false, nil
+    self.lastGateJumpPulse, self.jumpHumanoid = false, nil
+    local success = self:_restoreCallbacks(true)
+    if not success then
+        self:release()
+        self:_warn("restore", "a controls callback could not be restored")
+    end
+    return success
+end
+
+function Gate:_installMovement(controls, move, render)
+    local token = {}
+    local function ownsMovement()
+        return self.active and self.movementOwned and self.controls == controls and self.movementToken == token
+    end
+    local moveWrapper = function(...)
+        if ownsMovement() then
+            return
+        end
+        return move(...)
+    end
+    local renderWrapper = function(owner, ...)
+        if not ownsMovement() or owner ~= controls then
+            return render(owner, ...)
+        end
+        local humanoid = field(owner, "humanoid")
+        if self.jumpHumanoid ~= humanoid or not alive(humanoid) then
+            self.lastGateJumpPulse = false
+        end
+        self.jumpHumanoid = humanoid
+        local freshRequest = alive(humanoid) and field(humanoid, "Jump") == true and not self.lastGateJumpPulse
+        local values = table.pack(pcall(render, owner, ...))
+        if ownsMovement() and field(owner, "humanoid") == humanoid and alive(humanoid) then
+            if field(humanoid, "Jump") == true then
+                self.lastGateJumpPulse = false
+            elseif freshRequest then
+                self.lastGateJumpPulse = pcall(function()
+                    humanoid.Jump = true
+                end)
+            else
+                self.lastGateJumpPulse = false
+            end
+        elseif self.movementToken == token then
+            self.lastGateJumpPulse, self.jumpHumanoid = false, nil
+        end
+        if not values[1] then
+            error(values[2], 0)
+        end
+        return table.unpack(values, 2, values.n)
+    end
+    self.movementOwned, self.movementToken = true, token
+    self.lastGateJumpPulse, self.jumpHumanoid = false, nil
+    local entries = {
+        { kind = "movement", key = "moveFunction", original = move, wrapper = moveWrapper },
+        { kind = "movement", key = "OnRenderStepped", original = render, wrapper = renderWrapper },
+    }
+    for _, entry in ipairs(entries) do
+        table.insert(self.callbacks, entry)
+    end
+    local installed = pcall(function()
+        for _, entry in ipairs(entries) do
+            controls[entry.key] = entry.wrapper
+            assert(field(controls, entry.key) == entry.wrapper)
+        end
+    end)
+    if not installed then
+        self:release()
+        self:_warn("install", "controls callbacks could not be gated")
+    end
+    return installed
+end
+
+function Gate:_acquire(wantMovement)
+    if self.destroyed then
+        return false
+    end
+    if type(self.options.isTouch) ~= "function" then
+        self:release()
+        self:_warn("touchMissing", "touch capability detection was unavailable")
+        return false
+    end
+    local touchOk, touch = pcall(self.options.isTouch)
+    if not touchOk or touch ~= true then
+        self:release()
+        return false
+    end
+    if type(self.options.resolveControls) ~= "function" then
+        self:release()
+        self:_warn("resolveMissing", "player controls could not be resolved")
+        return false
+    end
+    local resolved, controls = pcall(self.options.resolveControls)
+    if not resolved or type(controls) ~= "table" then
+        self:release()
+        self:_warn("resolve", "player controls could not be resolved")
+        return false
+    end
+    if self.active and controls == self.controls then
+        if disabled(controls) then
+            self:release()
+            self:_warn("disabledActive", "native controls were disabled by another owner")
+            return false
+        end
+        if not self:_ownsCallbacks() then
+            self:release()
+            self:_warn("ownership", "another owner changed a controls callback")
+            return false
+        end
+        if not wantMovement then
+            return self:pauseMovement()
+        elseif self.movementOwned then
+            return true
+        end
+        local move = callable(controls, "moveFunction")
+        local render = callable(controls, "OnRenderStepped")
+        if not move or not render then
+            self:release()
+            self:_warn("shape", "this player-controls variant does not expose the required callbacks")
+            return false
+        end
+        return self:_installMovement(controls, move, render)
+    end
+    if self.controls and not self:release() then
+        return false
+    end
+    local move = callable(controls, "moveFunction")
+    local render = callable(controls, "OnRenderStepped")
+    local computer = callable(controls, "SelectComputerMovementModule")
+    local selectTouch = callable(controls, "SelectTouchModule")
+    if not move or not render or not computer or not selectTouch then
+        self:_warn("shape", "this player-controls variant does not expose the required callbacks")
+        return false
+    end
+    local mayRecover = not self.initialChecked and self.options.recoverDisabled == true and not self.recoveryUsed
+    self.initialChecked = true
+    local needsRecovery = disabled(controls)
+    if needsRecovery and not mayRecover then
+        self:_warn("disabled", "native disabled controls remain owned by the game")
+        return false
+    end
+    local token = {}
+    local computerWrapper = function(owner, ...)
+        if self.active and self.controls == controls and self.selectorToken == token and owner == controls then
+            local accepted, selected = selectTouchValues(selectTouch, owner)
+            if accepted then
+                return table.unpack(selected, 2, selected.n)
+            end
+            self:_warn("selectTouch", "touch controller selection was unavailable")
+        end
+        return computer(owner, ...)
+    end
+    self.controls, self.resync, self.active = controls, callable(controls, "OnLastInputTypeChanged"), true
+    self.selectorToken = token
+    self.callbacks = {
+        { kind = "selector", key = "SelectComputerMovementModule", original = computer, wrapper = computerWrapper },
+    }
+    local installed = pcall(function()
+        controls.SelectComputerMovementModule = computerWrapper
+        assert(field(controls, "SelectComputerMovementModule") == computerWrapper)
+    end)
+    if not installed then
+        self:release()
+        self:_warn("install", "controls callbacks could not be gated")
+        return false
+    end
+    if wantMovement and not self:_installMovement(controls, move, render) then
+        return false
+    end
+    local switch = callable(controls, "SwitchToController")
+    if field(controls, "touchControlFrame") ~= nil and switch then
+        local accepted, selected = selectTouchValues(selectTouch, controls)
+        if accepted then
+            local switched, switchAccepted = pcall(switch, controls, selected[2])
+            if not switched or switchAccepted == false then
+                self:release()
+                self:_warn("switch", "native touch controller could not be selected")
+                return false
+            end
+        else
+            self:_warn("selectTouch", "touch controller selection was unavailable")
+        end
+    end
+    if needsRecovery then
+        self.recoveryUsed = true
+        local enable = callable(controls, "Enable")
+        local enabledOk, accepted = false, nil
+        if enable then
+            enabledOk, accepted = pcall(enable, controls)
+        end
+        if not enabledOk or accepted == false or disabled(controls) then
+            self:release()
+            self:_warn("enable", "native touch controls could not be restored")
+            return false
+        end
+    end
+    return true
+end
+
+function Gate:setEnabled(enabled)
+    if enabled then
+        if not self.destroyed and type(self.options.isRunning) == "function" then
+            local runningOk, running = pcall(self.options.isRunning)
+            if runningOk and running == true then
+                return self:_acquire(false)
+            end
+        end
+        return self:release()
+    end
+    return self:_acquire(true)
+end
+
+function Gate:destroy()
+    local success = self:release()
+    self.destroyed = true
+    return success
+end
+
+return Gate
+end)()
+do
+    local nativeGetService, virtualInput = getService, nil
+    getService = function(name)
+        if name ~= "VirtualInputManager" then return nativeGetService(name) end
+        if not virtualInput then
+            local success, native = pcall(nativeGetService, name)
+            virtualInput = SanXCompat.createVirtualInput(success and native or nil)
+            local inputService = nativeGetService("UserInputService")
+            local sendKey = virtualInput.SendKeyEvent
+            virtualInput.SendKeyEvent = function(owner, isDown, ...)
+                if isDown then
+                    local checked, focused = pcall(inputService.GetFocusedTextBox, inputService)
+                    if checked and focused then
+                        error("SanX Delta: automatic keys wait while text is being edited", 0)
+                    end
+                end
+                return sendKey(owner, isDown, ...)
+            end
+        end
+        return virtualInput
+    end
 end
 local argumentHelpers = { [108] = table.pack, [66] = unpack, [58] = table.move }
 argumentHelpers.unpackValues = function(helpers, values)
@@ -49,7 +640,9 @@ components.coreSettings = function(context)
         game.Loaded:Wait()
     end
     if type(_G.DungeonAutofarmDestruct) == "function" then
+        local sanxPreviousCopy = _G.DungeonAutofarmVersion == "v3.0 c84b"
         local success, sharedValue = pcall(_G.DungeonAutofarmDestruct)
+        context.SanXRecoverOldTouchControls = success and sanxPreviousCopy
         if not success then
             warn("[DQ] could not stop the previous copy: " .. tostring(sharedValue))
         end
@@ -73,10 +666,10 @@ components.coreSettings = function(context)
         pcall(_G.DungeonAutofarmDestruct)
     end
     _G.DungeonAutofarmVersion = "v3.0 c84b"
-    local burstMin, burstMaxSpeed = 22, 38
+    local burstMin, burstMaxSpeed = 18, 28
     local config = {
         tweenWalk = 16,
-        tweenEscape = 36,
+        tweenEscape = 26,
         burstMin = burstMin,
         burstMax = burstMaxSpeed,
         burstMargin = 1.15,
@@ -98,7 +691,7 @@ components.coreSettings = function(context)
         wallTransparency = 0,
         wallClearView = true,
         watchToFile = true,
-        bubbleRadius = 4.8,
+        bubbleRadius = 2.8,
         bubbleLookahead = 1,
         bubbleSettle = 0.25,
         bubbleMinWeight = 0.25,
@@ -106,9 +699,9 @@ components.coreSettings = function(context)
         drawScan = true,
         bubbleHardAt = 1,
         bubbleSoftCost = 8,
-        bubbleTrajLead = 3.2,
+        bubbleTrajLead = 2.4,
         bubbleTrajCost = 14,
-        bubbleWarnLead = 2.2,
+        bubbleWarnLead = 1.5,
         missileAxisCost = 1.2,
         missileAxisCap = 30,
         bobSpikeTowardCost = 12,
@@ -174,8 +767,8 @@ components.coreSettings = function(context)
         firstCastWaitFit = 1,
         mobPathClear = 10,
         mobKeepOutWeight = 0.35,
-        warriorKeepOut = 18,
-        spearmanKeepOut = 16,
+        warriorKeepOut = 14,
+        spearmanKeepOut = 12,
         warriorKeepOutWeight = 0.7,
         homeIdleFor = 2,
         meleeSwing = true,
@@ -183,11 +776,11 @@ components.coreSettings = function(context)
         meleeSwingPace = 10,
         meleeSwingDone = 20,
         meleeEscape = true,
-        meleeEscapeAt = 42,
+        meleeEscapeAt = 36,
         meleeEscapeHyst = 10,
         meleeAwayD = 22,
         meleeBurst = true,
-        casterWhileDodging = false,
+        casterWhileDodging = true,
         faceTarget = true,
         faceWithin = 25,
         odinV2 = true,
@@ -335,7 +928,7 @@ components.coreSettings = function(context)
         bubbleTurnCost = 30,
         bubbleStickFor = 1,
         mobSideDodge = true,
-        mobSideWeight = 80,
+        mobSideWeight = 55,
         wallClear = 3,
         sideRoomFull = 30,
         pitWall = true,
@@ -348,15 +941,15 @@ components.coreSettings = function(context)
         bubbleStickWeight = 6,
         bubbleProbe = 72,
         bubbleOpenWeight = 0.55,
-        bubbleCornerBoost = 8.0,
-        bubbleWallPenalty = 6.0,
+        bubbleCornerBoost = 3,
+        bubbleWallPenalty = 3,
         bubbleLead = 0.35,
         spikeAheadStuds = 2,
         spikeAheadFly = 80,
-        spikeAheadTime = 0.85,
+        spikeAheadTime = 0.5,
         spikeAheadTrim = 4,
-        warnAheadTime = 1.4,
-        warnAheadWeight = 0.85,
+        warnAheadTime = 0.9,
+        warnAheadWeight = 0.55,
         spikeGrowMax = 1.7,
         beamCrossYoung = 0.5,
         beamCrossHold = 0.9,
@@ -371,7 +964,7 @@ components.coreSettings = function(context)
         bubbleFarOut = 70,
         bubbleCleanExtra = 15,
         cleanTtiFloor = 1.2,
-        cleanTtiMargin = 0.35,
+        cleanTtiMargin = 0.15,
         cleanHurryExtra = 0,
         cleanFarTime = 1.8,
         arriveHold = 1,
@@ -383,12 +976,12 @@ components.coreSettings = function(context)
         scanNodeEvery = 3,
         insideExtra = 6,
         walkSoftMax = 3,
-        leanWhileLethal = 0.9,
+        leanWhileLethal = 0.25,
         spreadOutSlack = 3,
         roomyMargin = 10,
         seekAlongMax = 8,
-        bubbleRays = 72,
-        bubbleNearWeight = 8.5,
+        bubbleRays = 48,
+        bubbleNearWeight = 4.5,
         bubbleCommit = 0.9,
         bubbleCommitMob = 0.9,
         bubbleArrive = 1.5,
@@ -436,7 +1029,7 @@ components.coreSettings = function(context)
         abilityRangeKnown = 65,
         gatherMobs = true,
         strafe = true,
-        castSafe = true,
+        castSafe = false,
         castSafeGrace = 0.6,
         ringBandRadius = 81.25,
         ringBandWeight = 0.3,
@@ -790,7 +1383,7 @@ components.coreSettings = function(context)
         wallsWaitFor = 180,
         wallLogo = true,
         classProfile = "mage",
-        slamTellRun = true,
+        slamTellRun = false,
         slamTellFor = 2.2,
         strikeWaitReady = true,
         strikeWaitOut = 20,
@@ -2095,7 +2688,7 @@ components.coreSettings = function(context)
                 bubbleArrive = 1.5,
                 bubbleBreachFloor = 3,
                 bubbleCommit = 0.9,
-                bubbleCornerBoost = 8.0,
+                bubbleCornerBoost = 3,
                 bubbleDetourLeg = 14,
                 bubbleDetourStick = 4,
                 bubbleDetourStuck = 3,
@@ -2105,21 +2698,21 @@ components.coreSettings = function(context)
                 bubbleLookahead = 1,
                 bubbleMaxOut = 46,
                 bubbleMinWeight = 0.25,
-                bubbleNearWeight = 8.5,
+                bubbleNearWeight = 4.5,
                 bubbleNoFlip = 2.5,
                 bubbleOpenWeight = 0.55,
                 bubbleProbe = 72,
-                bubbleRadius = 4.8,
-                bubbleRays = 72,
+                bubbleRadius = 2.8,
+                bubbleRays = 48,
                 bubbleSettle = 0.25,
                 bubbleSoftCost = 8,
                 bubbleStep = 1,
                 bubbleTrajCost = 14,
-                bubbleTrajLead = 3.2,
-                bubbleWallPenalty = 6.0,
-                bubbleWarnLead = 2.2,
-                burstMax = 38,
-                castSafe = true,
+                bubbleTrajLead = 2.4,
+                bubbleWallPenalty = 3,
+                bubbleWarnLead = 1.5,
+                burstMax = 28,
+                castSafe = false,
                 champKeepOutRadius = 28,
                 colorFloor = "#3cdc78",
                 colorLive = "#ff3232",
@@ -2206,7 +2799,7 @@ components.coreSettings = function(context)
                 wallTransparency = 0,
                 wallsOn = true,
                 wallsV2 = true,
-                warriorKeepOut = 18,
+                warriorKeepOut = 14,
                 watchToFile = true,
             },
             warrior = {
@@ -2247,7 +2840,7 @@ components.coreSettings = function(context)
                 bubbleArrive = 1.5,
                 bubbleBreachFloor = 3,
                 bubbleCommit = 0.9,
-                bubbleCornerBoost = 8.0,
+                bubbleCornerBoost = 3,
                 bubbleDetourLeg = 14,
                 bubbleDetourStick = 4,
                 bubbleDetourStuck = 3,
@@ -2257,21 +2850,21 @@ components.coreSettings = function(context)
                 bubbleLookahead = 1,
                 bubbleMaxOut = 46,
                 bubbleMinWeight = 0.25,
-                bubbleNearWeight = 8.5,
+                bubbleNearWeight = 4.5,
                 bubbleNoFlip = 2.5,
                 bubbleOpenWeight = 0.55,
                 bubbleProbe = 72,
-                bubbleRadius = 4.8,
-                bubbleRays = 72,
+                bubbleRadius = 2.525,
+                bubbleRays = 48,
                 bubbleSettle = 0.25,
                 bubbleSoftCost = 8,
                 bubbleStep = 1,
                 bubbleTrajCost = 14,
-                bubbleTrajLead = 3.2,
-                bubbleWallPenalty = 6.0,
-                bubbleWarnLead = 2.2,
-                burstMax = 38,
-                castSafe = true,
+                bubbleTrajLead = 2.4,
+                bubbleWallPenalty = 3,
+                bubbleWarnLead = 1.5,
+                burstMax = 28,
+                castSafe = false,
                 champKeepOutRadius = 28,
                 colorFloor = "#3cdc78",
                 colorLive = "#ff3232",
@@ -2350,7 +2943,7 @@ components.coreSettings = function(context)
                 wallClearView = true,
                 wallsOn = true,
                 wallsV2 = true,
-                warriorKeepOut = 18,
+                warriorKeepOut = 14,
                 watchToFile = true,
             },
         }, {
@@ -2629,6 +3222,9 @@ components.coreSettings = function(context)
     context.ReplicatedStorage = replicatedStorage
     context.HttpService = httpService
     context.UserInputService = userInputService
+    local sanxViewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280, 720)
+    context.COMPACT = userInputService.TouchEnabled == true and (not userInputService.KeyboardEnabled or math.min(sanxViewport.X, sanxViewport.Y) < 900)
+    context.SanXCapabilities = SanXCompat.capabilities()
     context.PathfindingService = pathfindingService
     context.VirtualInputManager = virtualInputManager
     context.CFG = config
@@ -51630,7 +52226,40 @@ components.movementCombat = function(context)
     local function getMovementSpeed()
         return capturedContext[2].walkSpeed or capturedContext[1].tweenWalk
     end
+    local sanxDeltaGate = SanXDeltaControls.new({
+        resolveControls = function()
+            local scripts = localPlayer:FindFirstChild("PlayerScripts")
+            local module = scripts and scripts:FindFirstChild("PlayerModule")
+            if not module then return nil end
+            return require(module):GetControls()
+        end,
+        isTouch = function()
+            return getService("UserInputService").TouchEnabled == true
+        end,
+        isRunning = function()
+            return capturedContext[2].farmEnabled == true and capturedContext[2].destroyed ~= true
+        end,
+        getLastInputType = function()
+            return getService("UserInputService"):GetLastInputType()
+        end,
+        recoverDisabled = context.SanXRecoverOldTouchControls == true,
+        warn = function(message) warn(message) end,
+    })
+    context.SanXDeltaControls = sanxDeltaGate
     local function setControlsEnabled(argument)
+        if getService("UserInputService").TouchEnabled then
+            local controlsAt = os.clock()
+            if not argument and movement.controlsOff and controlsAt - (movement.controlsAt or 0) < (capturedContext[1].controlsRecheck or 1) then
+                return
+            end
+            if sanxDeltaGate:setEnabled(argument) then
+                movement.controlsOff = not argument
+                movement.controlsAt = controlsAt
+            else
+                movement.controlsOff = false
+            end
+            return
+        end
         local controlsAt, controlsOff, controlsOff2 = os.clock(), movement.controlsOff, not argument
         if controlsOff == controlsOff2 then
             if controlsAt - (movement.controlsAt or 0) < (capturedContext[1].controlsRecheck or 1) then
@@ -51674,6 +52303,7 @@ components.movementCombat = function(context)
         end
     end
     local function buffSeen()
+        sanxDeltaGate:release()
         movement.controlsOff = false
         movement.controlsAt = 0
         movement.stallLogged = false
@@ -68569,17 +69199,15 @@ components.movementCombat = function(context)
         )
     end
     local function helper41(argument, ...)
-        local value = {}
-        if pcall(argument, virtualInputManager, ...) then
-            return
+        if type(argument) ~= "function" then
+            return false
         end
-        value[1] = capturedContext[2]
-        value[2] = (capturedContext[2].vimRetries or 0) + 1
-        value[1].vimRetries = value[2]
-        local value2 = table.pack(...)
-        task.spawn(function()
-            pcall(argument, virtualInputManager, table.unpack(value2, 1, value2.n))
-        end)
+        if pcall(argument, virtualInputManager, ...) then
+            return true
+        end
+        capturedContext[2].vimRetries = (capturedContext[2].vimRetries or 0) + 1
+        local success = pcall(argument, virtualInputManager, ...)
+        return success
     end
     context.pkHealPace = function()
         return math.max(capturedContext[1].pkHealEvery or 3, (capturedContext[1].pkHealCycle or 6.5) / 2)
@@ -68797,7 +69425,107 @@ components.movementCombat = function(context)
         movement.facedAt = os.clock()
         return false
     end
+    local sanxDeltaKeys = (function()
+local DeltaKeys = {}
+
+function DeltaKeys.new(options)
+    local state = options.state
+    local send = options.send
+    local delay = options.delay
+    local now = options.now
+    local maxAttempts, retryGap, retryRest = 4, 0.05, 0.5
+    local closed = false
+    state.keyDown = state.keyDown or {}
+    local manager = {}
+    local attempt
+
+    local function current(key, press)
+        return state.keyDown and state.keyDown[key] == press
+    end
+
+    attempt = function(key, press, force)
+        if not current(key, press) then return true end
+        if press.inFlight or (press.pending and not force) then return false end
+        if press.attempts >= maxAttempts then return false end
+        press.inFlight = true
+        press.attempts += 1
+        local ok, delivered = pcall(send, false, key)
+        press.inFlight = false
+        if not current(key, press) then return true end
+        if ok and delivered == true then
+            state.keyDown[key] = nil
+            return true
+        end
+        press.failedAt = now()
+        if press.attempts < maxAttempts and not press.pending then
+            press.pending = true
+            delay(retryGap, function()
+                press.pending = false
+                attempt(key, press)
+            end)
+        end
+        return false
+    end
+
+    function manager:canPress(key)
+        if closed or state.destroyed then return false end
+        local press = state.keyDown and state.keyDown[key]
+        if not press then return true end
+        if type(press) == "table" and press.sanxDeltaKey then
+            if not press.inFlight and not press.pending and press.attempts >= maxAttempts
+                and now() - (press.failedAt or 0) >= retryRest then
+                press.attempts = 0
+                attempt(key, press)
+            end
+        end
+        return false
+    end
+
+    function manager:track(key)
+        local press = { sanxDeltaKey = true, attempts = 0 }
+        state.keyDown[key] = press
+        press.release = function() return attempt(key, press) end
+        if closed or state.destroyed then press.release() end
+        return press
+    end
+
+    function manager:isHeld(key, press)
+        return current(key, press)
+    end
+
+    function manager:destroy()
+        if closed then return end
+        closed = true
+        local keys = {}
+        for key in pairs(state.keyDown or {}) do keys[#keys + 1] = key end
+        for _, key in ipairs(keys) do
+            local press = state.keyDown[key]
+            if type(press) ~= "table" or not press.sanxDeltaKey then
+                press = { sanxDeltaKey = true, attempts = 0 }
+                state.keyDown[key] = press
+            end
+            press.attempts = 0
+            attempt(key, press, true)
+        end
+    end
+
+    return manager
+end
+
+return DeltaKeys
+    end)().new({
+        state = capturedContext[2],
+        send = function(isDown, key)
+            return helper41(virtualInputManager.SendKeyEvent, isDown, key, false, game)
+        end,
+        delay = task.delay,
+        now = os.clock,
+    })
+    context.SanXDeltaKeys = sanxDeltaKeys
     local function helper42(argument)
+        if not sanxDeltaKeys:canPress(argument) then
+            return false
+        end
         local value = {}
         if capturedContext[2].bugKey then
             local protectedCall, bugKey, value2 =
@@ -68947,34 +69675,22 @@ components.movementCombat = function(context)
                 value[3].healPaceAt = value[4]
             end
         end
-        helper41(virtualInputManager.SendKeyEvent, true, argument, false, game)
-        value[5] = capturedContext[2]
-        value[6] = capturedContext[2].keyDown or {}
-        value[5].keyDown = value[6]
-        value[7] = capturedContext[2].keyDown
-        value[7][argument] = true
-        local function keyUp()
-            local value3 = {}
-            if capturedContext[2].keyDown[argument] then
-                value3[1] = capturedContext[2].keyDown
-                value3[2] = argument
-                value3[1][value3[2]] = nil
-                helper41(virtualInputManager.SendKeyEvent, false, argument, false, game)
-            end
+        if not helper41(virtualInputManager.SendKeyEvent, true, argument, false, game) then
+            return false
         end
+        local sanxPress = sanxDeltaKeys:track(argument)
+        local keyUp = sanxPress.release
         value[8] = capturedContext[2]
         value[8].keyUp = keyUp
         task.delay(0.05, keyUp)
         task.spawn(function()
             for index = 1, 5, 1 do
-                if not capturedContext[2].keyDown[argument] then
+                if not sanxDeltaKeys:isHeld(argument, sanxPress) then
                     return
                 end
-                if context.BB then
-                    if context.BB.lethal then
-                        keyUp()
-                        return
-                    end
+                if context.BB and context.BB.lethal then
+                    keyUp()
+                    return
                 end
                 task.wait(0.01)
             end
@@ -71324,7 +72040,9 @@ components.movementCombat = function(context)
             value[1].swingBlocked = value[2]
             return false
         end
-        helper41(virtualInputManager.SendMouseButtonEvent, value4, value5, 0, true, game, 0)
+        if not helper41(virtualInputManager.SendMouseButtonEvent, value4, value5, 0, true, game, 0) then
+            return false
+        end
         task.delay(0.03, function()
             helper41(virtualInputManager.SendMouseButtonEvent, value4, value5, 0, false, game, 0)
         end)
@@ -123961,6 +124679,11 @@ components.uiLibrary = function(context)
     local runtimeState, config, localPlayer, userInputService =
         context.RT, context.CFG, context.LocalPlayer, context.UserInputService
     local runService, theme = context.RunService, {}
+    context.sanxPointerOwns = function(owner, input, ending)
+        if not owner then return false end
+        if owner.UserInputType == Enum.UserInputType.Touch then return input == owner end
+        return input.UserInputType == (ending and Enum.UserInputType.MouseButton1 or Enum.UserInputType.MouseMovement)
+    end
     theme.TextPrimary = Color3.fromHex("edf4ff")
     theme.TextSub = Color3.fromHex("a6b3c8")
     theme.TextMuted = Color3.fromHex("77869e")
@@ -124505,17 +125228,21 @@ components.uiLibrary = function(context)
         argument.Active = true
         return {
             onClick = function(argument3)
-                local function helper3(input)
-                    if
-                        input.UserInputType == Enum.UserInputType.MouseButton1
-                        or input.UserInputType == Enum.UserInputType.Touch
-                    then
-                        if pressOnTop(argument, input) then
-                            argument3()
-                        end
+                argument.InputBegan:Connect(function(input)
+                    if not pressOnTop(argument, input) then return end
+                    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+                        argument3()
+                    elseif input.UserInputType == Enum.UserInputType.Touch then
+                        local origin, moved, connection = input.Position, false, nil
+                        connection = input.Changed:Connect(function()
+                            moved = moved or (input.Position - origin).Magnitude > 10
+                            if input.UserInputState == Enum.UserInputState.End or input.UserInputState == Enum.UserInputState.Cancel then
+                                connection:Disconnect()
+                                if input.UserInputState == Enum.UserInputState.End and not moved and argument.Parent and pressOnTop(argument, input) then argument3() end
+                            end
+                        end)
                     end
-                end
-                argument.InputBegan:Connect(helper3)
+                end)
             end,
         }
     end
@@ -124829,18 +125556,14 @@ components.uiLibrary = function(context)
                 input.UserInputType == Enum.UserInputType.MouseButton1
                 or input.UserInputType == Enum.UserInputType.Touch
             then
-                value4 = true
+                value4 = input
                 helper2(input.Position.X)
             end
         end)
         table.insert(
             context.sliderConnections,
             userInputService.InputChanged:Connect(function(input)
-                local value2 = value4
-                    and (
-                        input.UserInputType == Enum.UserInputType.MouseMovement
-                        or input.UserInputType == Enum.UserInputType.Touch
-                    )
+                local value2 = context.sanxPointerOwns(value4, input)
                 if value2 then
                     helper2(input.Position.X)
                 end
@@ -124849,11 +125572,7 @@ components.uiLibrary = function(context)
         table.insert(
             context.sliderConnections,
             userInputService.InputEnded:Connect(function(input)
-                if input.UserInputType == Enum.UserInputType.MouseButton1 then
-                    value4 = false
-                elseif input.UserInputType == Enum.UserInputType.Touch then
-                    value4 = false
-                end
+                if context.sanxPointerOwns(value4, input, true) then value4 = false end
             end)
         )
         tip(slider2, argument9)
@@ -124978,7 +125697,7 @@ components.uiLibrary = function(context)
                 or ("%d - %d"):format(value5, value6) .. value4
         end
         render()
-        local value9
+        local value9, sanxDragInput
         local function helper3(argument9)
             local value5 = math.clamp((argument9 - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
             return math.floor(argument3 + (argument4 - argument3) * value5 + 0.5)
@@ -125020,6 +125739,7 @@ components.uiLibrary = function(context)
                 if track.AbsoluteSize.X <= 0 then
                     return
                 end
+                sanxDragInput = input
                 local value5, value6, value7 = helper3(input.Position.X), helper2()
                 value9 = if value6 == value7 and value5 == value6
                     then "both"
@@ -125034,11 +125754,7 @@ components.uiLibrary = function(context)
         table.insert(
             context.sliderConnections,
             userInputService.InputChanged:Connect(function(input)
-                local value5 = value9
-                    and (
-                        input.UserInputType == Enum.UserInputType.MouseMovement
-                        or input.UserInputType == Enum.UserInputType.Touch
-                    )
+                local value5 = value9 and context.sanxPointerOwns(sanxDragInput, input)
                 if value5 then
                     helper4(input.Position.X)
                 end
@@ -125047,11 +125763,7 @@ components.uiLibrary = function(context)
         table.insert(
             context.sliderConnections,
             userInputService.InputEnded:Connect(function(input)
-                if input.UserInputType == Enum.UserInputType.MouseButton1 then
-                    value9 = nil
-                elseif input.UserInputType == Enum.UserInputType.Touch then
-                    value9 = nil
-                end
+                if context.sanxPointerOwns(sanxDragInput, input, true) then value9, sanxDragInput = nil, nil end
             end)
         )
         tip(rangeSlider2, argument7)
@@ -125466,7 +126178,7 @@ components.uiLibrary = function(context)
                 input.UserInputType == Enum.UserInputType.MouseButton1
                 or input.UserInputType == Enum.UserInputType.Touch
             then
-                value5 = true
+                value5 = input
                 helper(input.Position.X, input.Position.Y)
             end
         end)
@@ -125478,7 +126190,7 @@ components.uiLibrary = function(context)
                 input.UserInputType == Enum.UserInputType.MouseButton1
                 or input.UserInputType == Enum.UserInputType.Touch
             then
-                value6 = true
+                value6 = input
                 helper2(input.Position.Y)
             end
         end)
@@ -125490,10 +126202,10 @@ components.uiLibrary = function(context)
                         return
                     end
                 end
-                if value5 then
+                if context.sanxPointerOwns(value5, input) then
                     helper(input.Position.X, input.Position.Y)
                 end
-                if value6 then
+                if context.sanxPointerOwns(value6, input) then
                     helper2(input.Position.Y)
                 end
             end)
@@ -125501,11 +126213,8 @@ components.uiLibrary = function(context)
         table.insert(
             context.sliderConnections,
             userInputService.InputEnded:Connect(function(input)
-                if input.UserInputType == Enum.UserInputType.MouseButton1 then
-                    value5, value6 = false, false
-                elseif input.UserInputType == Enum.UserInputType.Touch then
-                    value5, value6 = false, false
-                end
+                if context.sanxPointerOwns(value5, input, true) then value5 = false end
+                if context.sanxPointerOwns(value6, input, true) then value6 = false end
             end)
         )
         value.onClick(function()
@@ -125662,7 +126371,7 @@ components.uiLibrary = function(context)
                 input.UserInputType == Enum.UserInputType.MouseButton1
                 or input.UserInputType == Enum.UserInputType.Touch
             then
-                value5 = true
+                value5 = input
                 helper3(input.Position.X, input.Position.Y)
             end
         end)
@@ -125674,7 +126383,7 @@ components.uiLibrary = function(context)
                 input.UserInputType == Enum.UserInputType.MouseButton1
                 or input.UserInputType == Enum.UserInputType.Touch
             then
-                value6 = true
+                value6 = input
                 helper4(input.Position.X)
             end
         end)
@@ -125686,10 +126395,10 @@ components.uiLibrary = function(context)
                         return
                     end
                 end
-                if value5 then
+                if context.sanxPointerOwns(value5, input) then
                     helper3(input.Position.X, input.Position.Y)
                 end
-                if value6 then
+                if context.sanxPointerOwns(value6, input) then
                     helper4(input.Position.X)
                 end
             end)
@@ -125697,11 +126406,8 @@ components.uiLibrary = function(context)
         table.insert(
             context.sliderConnections,
             userInputService.InputEnded:Connect(function(input)
-                if input.UserInputType == Enum.UserInputType.MouseButton1 then
-                    value5, value6 = false, false
-                elseif input.UserInputType == Enum.UserInputType.Touch then
-                    value5, value6 = false, false
-                end
+                if context.sanxPointerOwns(value5, input, true) then value5 = false end
+                if context.sanxPointerOwns(value6, input, true) then value6 = false end
             end)
         )
         value.onClick(function()
@@ -142985,7 +143691,15 @@ components.interfaceMainLoop = function(context)
             return
         end
         runtimeState.destroyed = true
+        if context.SanXDeltaKeys then
+            pcall(context.SanXDeltaKeys.destroy, context.SanXDeltaKeys)
+        end
         pcall(saveConfig)
+        pcall(function()
+            if context.SanXDeltaControls then
+                context.SanXDeltaControls:destroy()
+            end
+        end)
         pcall(function()
             local hlBeamWalls = workspaceService:FindFirstChild("HLBeamWalls")
             if hlBeamWalls then
@@ -143556,7 +144270,7 @@ components.interfaceMainLoop = function(context)
         }, value30)
         helper22("TextButton", {
             Name = "FreeMouse",
-            Modal = true,
+            Modal = not userInputService.TouchEnabled,
             Text = "",
             BackgroundTransparency = 1,
             Size = UDim2.fromOffset(0, 0),
@@ -143591,24 +144305,28 @@ components.interfaceMainLoop = function(context)
             local vector2 = value5 and helper36() or helper35()
             return math.clamp(math.min((vector2.X - 24) / 312, (vector2.Y - 24) / 520), 0.5, 1)
         end
+        local function sanxClampWindow(position)
+            local viewport = value5 and helper36() or helper35()
+            local padding = userInputService.TouchEnabled and 4 or 12
+            return Vector2.new(
+                math.clamp(position.X, padding, math.max(padding, viewport.X - value24 * value33 - padding)),
+                math.clamp(position.Y, padding, math.max(padding, viewport.Y - value25 * value33 - padding))
+            )
+        end
         local function stroke()
-            local vector2 = value5 and helper36() or helper35()
-            value33 = if value5
-                then math.clamp(math.min((vector2.X - 8) / value13, (vector2.Y - 8) / value14), 0.6, 1)
-                else math.clamp(math.min((vector2.X - 24) / value13, (vector2.Y - 24) / value14), 0.5, 1)
-            if value38 then
-                value38.Scale = helper40()
-            end
+            local viewport = value5 and helper36() or helper35()
+            local padding = userInputService.TouchEnabled and 8 or 24
+            value33 = math.max(0.05, math.min(1, (viewport.X - padding) / math.max(value24, 1), (viewport.Y - padding) / math.max(value25, 1)))
+            if value38 then value38.Scale = helper40() end
             if not value34 then
                 value34 = true
-                value35 = Vector2.new(
-                    math.floor((vector2.X - value24 * value33) / 2),
-                    math.floor((vector2.Y - value25 * value33) / 2)
-                )
+                value35 = Vector2.new(math.floor((viewport.X - value24 * value33) / 2), math.floor((viewport.Y - value25 * value33) / 2))
                 value36 = value35
             end
+            value35, value36 = sanxClampWindow(value35), sanxClampWindow(value36)
             helper39()
         end
+        local sanxFitViewport = stroke
         stroke()
         if workspace.CurrentCamera then
             helper6(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"), stroke)
@@ -144181,24 +144899,24 @@ components.interfaceMainLoop = function(context)
         do
             local value72, value73
             helper6(header.InputBegan, function(argument2)
-                if helper32(argument2) then
+                if helper32(argument2) and not value72 then
                     if context.pressOnTop(value30, argument2) then
                         local value
                         value, value72 =
-                            Vector2.new(argument2.Position.X, argument2.Position.Y) - value35, true
+                            Vector2.new(argument2.Position.X, argument2.Position.Y) - value35, argument2
                         value73 = value
                     end
                 end
             end)
             helper6(userInputService.InputChanged, function(argument2)
                 if value72 then
-                    if helper33(argument2) then
-                        value35 = Vector2.new(argument2.Position.X, argument2.Position.Y) - value73
+                    if context.sanxPointerOwns(value72, argument2) then
+                        value35 = sanxClampWindow(Vector2.new(argument2.Position.X, argument2.Position.Y) - value73)
                     end
                 end
             end)
             helper6(userInputService.InputEnded, function(argument2)
-                if helper32(argument2) then
+                if context.sanxPointerOwns(value72, argument2, true) then
                     value72 = false
                 end
             end)
@@ -144250,13 +144968,13 @@ components.interfaceMainLoop = function(context)
             helper6(value74.InputBegan, function(argument2)
                 if helper32(argument2) then
                     local position2
-                    position2, value76 = argument2.Position, true
+                    position2, value76 = argument2.Position, argument2
                     position, value77, value78, value67, value68 = position2, value24, value25, false, false
                 end
             end)
             helper6(userInputService.InputChanged, function(argument2)
                 if value76 then
-                    if helper33(argument2) then
+                    if context.sanxPointerOwns(value76, argument2) then
                         local vector2, vector3, value, value20, value21 =
                             Vector2.new(argument2.Position.X - position.X, argument2.Position.Y - position.Y)
                                 / value33,
@@ -144280,9 +144998,10 @@ components.interfaceMainLoop = function(context)
                 end
             end)
             helper6(userInputService.InputEnded, function(argument2)
-                if helper32(argument2) then
+                if context.sanxPointerOwns(value76, argument2, true) then
                     if value76 then
                         value76 = false
+                        sanxFitViewport()
                         helper38()
                     end
                 end
@@ -144762,11 +145481,12 @@ components.interfaceMainLoop = function(context)
             return value and value.frame or nil
         end
         value3.menuButton = function(argument2)
+            local sanxButtonSize = userInputService.TouchEnabled and 60 or 52
             local value = helper30(argument, {
                 Name = "MobileMenuButton",
                 AnchorPoint = Vector2.new(0, 0.5),
                 Position = UDim2.new(0, 14, 0.35, 0),
-                Size = UDim2.fromOffset(52, 52),
+                Size = UDim2.fromOffset(sanxButtonSize, sanxButtonSize),
                 BackgroundColor3 = theme.SurfaceHeader,
                 BackgroundTransparency = 0,
                 ZIndex = 60,
@@ -144793,8 +145513,8 @@ components.interfaceMainLoop = function(context)
             value20 = helper22("Frame", {
                 BackgroundTransparency = 1,
                 Position = UDim2.fromOffset(
-                    math.floor((52 - value21) / 2),
-                    math.floor((52 - value42) / 2) + 1
+                    math.floor((sanxButtonSize - value21) / 2),
+                    math.floor((sanxButtonSize - value42) / 2) + 1
                 ),
                 Size = UDim2.fromOffset(value21, value42),
                 ZIndex = 61,
@@ -144819,7 +145539,36 @@ components.interfaceMainLoop = function(context)
                 helper34(value, 0.2, { BackgroundColor3 = theme.SurfaceHeader })
             end)
             pressable(value)
-            helper6(value.Activated, argument2)
+            local sanxOwner, sanxOrigin, sanxTop, sanxMoved, sanxAcceptedInput
+            local function sanxPlaceButton(top)
+                local viewport = helper35()
+                value.AnchorPoint = Vector2.zero
+                value.Position = UDim2.fromOffset(
+                    math.clamp(top.X, 4, math.max(4, viewport.X - sanxButtonSize - 4)),
+                    math.clamp(top.Y, 4, math.max(4, viewport.Y - sanxButtonSize - 4))
+                )
+            end
+            helper6(value.InputBegan, function(input)
+                if sanxOwner or not helper32(input) then return end
+                sanxOwner, sanxOrigin, sanxTop, sanxMoved = input, input.Position, value.AbsolutePosition, false
+                sanxAcceptedInput = input
+            end)
+            helper6(userInputService.InputChanged, function(input)
+                if not context.sanxPointerOwns(sanxOwner, input) then return end
+                local delta = Vector2.new(input.Position.X - sanxOrigin.X, input.Position.Y - sanxOrigin.Y)
+                sanxMoved = sanxMoved or delta.Magnitude > 10
+                if sanxMoved then sanxPlaceButton(sanxTop + delta) end
+            end)
+            helper6(userInputService.InputEnded, function(input)
+                if context.sanxPointerOwns(sanxOwner, input, true) then sanxOwner = nil end
+            end)
+            if workspace.CurrentCamera then
+                helper6(workspace.CurrentCamera:GetPropertyChangedSignal('ViewportSize'), function() sanxPlaceButton(value.AbsolutePosition) end)
+            end
+            helper6(value.Activated, function(input)
+                if input and input.UserInputType == Enum.UserInputType.Touch and input ~= sanxAcceptedInput then return end
+                if not sanxMoved then argument2() end
+            end)
             return value
         end
         for index9, entry4 in ipairs(value97) do
@@ -148061,27 +148810,19 @@ components.interfaceMainLoop = function(context)
                     or input.UserInputType == Enum.UserInputType.Touch
                 then
                     if context.pressOnTop(colorTrack, input) then
-                        value49 = true
+                        value49 = input
                         helper64(input.Position.X)
                     end
                 end
             end)
             sliderConnections[#sliderConnections + 1] = userInputService.InputChanged:Connect(function(input)
-                local value = value49
-                    and (
-                        input.UserInputType == Enum.UserInputType.MouseMovement
-                        or input.UserInputType == Enum.UserInputType.Touch
-                    )
+                local value = context.sanxPointerOwns(value49, input)
                 if value then
                     helper64(input.Position.X)
                 end
             end)
             sliderConnections[#sliderConnections + 1] = userInputService.InputEnded:Connect(function(input)
-                if input.UserInputType == Enum.UserInputType.MouseButton1 then
-                    value49 = false
-                elseif input.UserInputType == Enum.UserInputType.Touch then
-                    value49 = false
-                end
+                if context.sanxPointerOwns(value49, input, true) then value49 = false end
             end)
             uiLibrary.tip(
                 colorBar,
@@ -149645,6 +150386,9 @@ components.interfaceMainLoop = function(context)
             1,
             "Rebind the key that opens and closes this window: click, then press the new key. Escape keeps the old one."
         )
+        if userInputService.TouchEnabled and not userInputService.KeyboardEnabled then
+            uiSettings.menuKeyButton.Visible = false
+        end
         uiLibrary.button(
             runsThisAccount.content,
             "Close the script",
@@ -151156,7 +151900,7 @@ components.interfaceMainLoop = function(context)
                 helper109()
             end)
         end
-        addAccount = config.mobileButton ~= false and (config.mobileButtonAlways == true or addAccount)
+        addAccount = (userInputService.TouchEnabled and not userInputService.KeyboardEnabled) or (config.mobileButton ~= false and (config.mobileButtonAlways == true or addAccount))
         if addAccount then
             helper110()
         elseif config.mobileButton ~= false and statusChip then
@@ -158902,40 +159646,6 @@ end
 if context.migrateSanxUI(context.CFG.sanxUiVersion) and context.saveConfig then
     pcall(context.saveConfig)
 end
--- ========================================================
--- SANX IMPROVED DODGING ENHANCEMENTS
--- ========================================================
-local cfg = context.CFG
-if cfg then
-    cfg.bubbleRadius = 4.8            -- Safe cushion around character (was 2.8 / 2.525)
-    cfg.bubbleRays = 72               -- High angular resolution for safe exit paths (was 48)
-    cfg.bubbleNearWeight = 8.5        -- Much higher urgency for nearby hazards (was 4.5)
-    cfg.bubbleCornerBoost = 8.0       -- Avoid getting trapped in corners (was 3.0)
-    cfg.bubbleWallPenalty = 6.0       -- Avoid dodging into walls (was 3.0)
-    cfg.bubbleWarnLead = 2.2          -- Lookahead lead for warned hazards (was 1.5)
-    cfg.bubbleTrajLead = 3.2          -- Lookahead lead for projectile trajectories (was 2.4)
-    cfg.cleanTtiMargin = 0.35         -- Buffer margin before time-to-impact (was 0.15)
-    cfg.spikeAheadTime = 0.85         -- Early detection for ground spikes (was 0.5)
-    cfg.warnAheadTime = 1.4           -- Early reaction to circle/fan telegraphs (was 0.9)
-    cfg.warnAheadWeight = 0.85        -- Weight of telegraph hazard warnings (was 0.55)
-    cfg.slamTellRun = true            -- Immediately flee boss slam tells/windups (was false)
-    cfg.slamTellWithin = 110          -- Boss slam detection distance (was 95)
-    cfg.slamTellFor = 2.5             -- Duration to maintain slam retreat (was 2.2)
-    cfg.castSafe = true               -- Prioritize dodging over greedy casting in danger (was false)
-    cfg.casterWhileDodging = false    -- Stop locking animations while actively evading (was true)
-    cfg.leanWhileLethal = 0.9         -- Full commitment dodging away from lethal hits (was 0.25)
-    cfg.burstMax = 38                 -- Max escape movement speed (was 28)
-    cfg.tweenEscape = 36              -- Escape tween speed (was 26)
-    cfg.mobSideDodge = true           -- Side-step incoming melee mobs (was true)
-    cfg.mobSideWeight = 80            -- Higher priority on dodging mob charges (was 55)
-    cfg.meleeEscape = true            -- Escape melee mobs when swarmed (was true)
-    cfg.meleeEscapeAt = 42            -- Distance to initiate melee escape (was 36)
-    cfg.warriorKeepOut = 18           -- Keep distance from warrior mobs (was 14)
-    cfg.spearmanKeepOut = 16          -- Keep distance from spearman thrusts (was 12)
-    cfg.spikeCrossBan = true          -- Never walk across active spike hazard zones (was true)
-    cfg.spikeCrossHorizon = 3.0       -- Horizon time for spike cross check (was 2.5)
-end
--- ========================================================
 components.attackCatalog(context)
 components.gearProfiles(context)
 components.movementBoost(context)
